@@ -41,6 +41,7 @@ const config = {
     },
     timeout: 10000
 };
+const DANMU_API = process.env.DANMU_API || "";
 
 /**
  * 创建 HTTPS Agent (忽略 SSL 证书验证)
@@ -467,6 +468,135 @@ const logWarn = (message) => {
 };
 
 /**
+ * 弹幕工具函数
+ */
+const preprocessTitle = (title) => {
+    if (!title) return "";
+    return title
+        .replace(/4[kK]|[xX]26[45]|720[pP]|1080[pP]|2160[pP]/g, " ")
+        .replace(/[hH]\\.?26[45]/g, " ")
+        .replace(/BluRay|WEB-DL|HDR|REMUX/gi, " ")
+        .replace(/\.mp4|\.mkv|\.avi|\.flv/gi, " ");
+};
+
+const chineseToArabic = (cn) => {
+    const map = { '零': 0, '一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9, '十': 10 };
+    if (!isNaN(cn)) return parseInt(cn, 10);
+    if (cn.length === 1) return map[cn] || cn;
+    if (cn.length === 2) {
+        if (cn[0] === '十') return 10 + map[cn[1]];
+        if (cn[1] === '十') return map[cn[0]] * 10;
+    }
+    if (cn.length === 3) return map[cn[0]] * 10 + map[cn[2]];
+    return cn;
+};
+
+const extractEpisode = (title) => {
+    if (!title) return "";
+    const processedTitle = preprocessTitle(title).trim();
+
+    const cnMatch = processedTitle.match(/第\s*([零一二三四五六七八九十0-9]+)\s*[集话章节回期]/);
+    if (cnMatch) return String(chineseToArabic(cnMatch[1]));
+
+    const seMatch = processedTitle.match(/[Ss](?:\d{1,2})?[-._\s]*[Ee](\d{1,3})/i);
+    if (seMatch) return seMatch[1];
+
+    const epMatch = processedTitle.match(/\b(?:EP|E)[-._\s]*(\d{1,3})\b/i);
+    if (epMatch) return epMatch[1];
+
+    const bracketMatch = processedTitle.match(/[\[\(【(](\d{1,3})[\]\)】)]/);
+    if (bracketMatch) {
+        const num = bracketMatch[1];
+        if (!["720", "1080", "480"].includes(num)) return num;
+    }
+
+    return "";
+};
+
+const buildFileNameForDanmu = (vodName, episodeTitle) => {
+    if (!vodName) return "";
+    if (!episodeTitle || episodeTitle === '正片' || episodeTitle === '播放') return vodName;
+
+    const digits = extractEpisode(episodeTitle);
+    if (digits) {
+        const epNum = parseInt(digits, 10);
+        if (epNum > 0) {
+            if (epNum < 10) return `${vodName} S01E0${epNum}`;
+            return `${vodName} S01E${epNum}`;
+        }
+    }
+    return vodName;
+};
+
+const matchDanmu = async (fileName) => {
+    if (!DANMU_API || !fileName) return [];
+
+    try {
+        logInfo(`匹配弹幕: ${fileName}`);
+        const matchUrl = `${DANMU_API}/api/v2/match`;
+        const response = await OmniBox.request(matchUrl, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            },
+            body: JSON.stringify({ fileName }),
+        });
+
+        if (response.statusCode !== 200) {
+            logInfo(`弹幕匹配失败: HTTP ${response.statusCode}`);
+            return [];
+        }
+
+        const matchData = JSON.parse(response.body);
+        if (!matchData.isMatched) return [];
+
+        const matches = matchData.matches || [];
+        if (matches.length === 0) return [];
+
+        const firstMatch = matches[0];
+        const episodeId = firstMatch.episodeId;
+        const animeTitle = firstMatch.animeTitle || "";
+        const episodeTitle = firstMatch.episodeTitle || "";
+        if (!episodeId) return [];
+
+        let danmakuName = "弹幕";
+        if (animeTitle && episodeTitle) {
+            danmakuName = `${animeTitle} - ${episodeTitle}`;
+        } else if (animeTitle) {
+            danmakuName = animeTitle;
+        } else if (episodeTitle) {
+            danmakuName = episodeTitle;
+        }
+
+        return [{
+            name: danmakuName,
+            url: `${DANMU_API}/api/v2/comment/${episodeId}?format=xml`,
+        }];
+    } catch (e) {
+        logWarn(`弹幕匹配失败: ${e.message}`);
+        return [];
+    }
+};
+
+const encodeMeta = (obj) => {
+    try {
+        return Buffer.from(JSON.stringify(obj), 'utf8').toString('base64');
+    } catch {
+        return '';
+    }
+};
+
+const decodeMeta = (str) => {
+    try {
+        const raw = Buffer.from(str, 'base64').toString('utf8');
+        return JSON.parse(raw);
+    } catch {
+        return {};
+    }
+};
+
+/**
  * API 请求函数
  */
 const apiRequest = async (data, path, cacheType = 'category', retries = 1) => {
@@ -815,7 +945,7 @@ async function detail(params) {
                             
                             vodPlaySources[0].episodes.push({
                                 name: playName,
-                                playId: playUrl
+                                playId: `${playUrl}|||${encodeMeta({ v: vod.vod_name || '', e: playName })}`
                             });
                         }
                     });
@@ -852,46 +982,73 @@ async function detail(params) {
  */
 async function play(params) {
     try {
-        const playId = params.playId;
+        let playId = params.playId;
+        let vodName = '';
+        let episodeName = '';
 
         if (!playId) {
             throw new Error("播放地址ID不能为空");
         }
 
+        if (playId.includes('|||')) {
+            const [mainPlayId, metaB64] = playId.split('|||');
+            playId = mainPlayId;
+            const meta = decodeMeta(metaB64 || '');
+            vodName = meta.v || '';
+            episodeName = meta.e || '';
+        }
+
         logInfo('获取播放地址', { playId: playId.substring(0, 50) + '...' });
 
         const parts = playId.split('||');
+        let playResponse;
         if (parts.length < 2) {
-            return { 
+            playResponse = {
                 urls: [{ name: '播放', url: playId }],
                 parse: 0 
             };
+        } else {
+            const paramStr = parts[0];
+            const resolutions = parts[1].split('@');
+
+            const requestParams = {};
+            paramStr.split('&').forEach(pair => {
+                const [k, v] = pair.split('=');
+                if (k) requestParams[k] = v || '';
+            });
+
+            if (resolutions.length > 0) {
+                resolutions.sort((a, b) => getResolutionScore(b) - getResolutionScore(a));
+                requestParams.resolution = resolutions[0];
+            }
+
+            const data = await apiRequest(requestParams, API_PATHS.VURL_DETAIL, 'play');
+
+            const playUrl = data?.url || '';
+            
+            logInfo('播放地址获取成功', { url: playUrl.substring(0, 50) + '...' });
+
+            playResponse = {
+                urls: [{ name: '播放', url: playUrl }],
+                parse: 0
+            };
         }
 
-        const paramStr = parts[0];
-        const resolutions = parts[1].split('@');
-
-        const requestParams = {};
-        paramStr.split('&').forEach(pair => {
-            const [k, v] = pair.split('=');
-            if (k) requestParams[k] = v || '';
-        });
-
-        if (resolutions.length > 0) {
-            resolutions.sort((a, b) => getResolutionScore(b) - getResolutionScore(a));
-            requestParams.resolution = resolutions[0];
+        if (DANMU_API && vodName) {
+            const fileName = buildFileNameForDanmu(vodName, episodeName);
+            logInfo(`尝试匹配弹幕文件名: ${fileName}`);
+            if (fileName) {
+                const danmakuList = await matchDanmu(fileName);
+                if (danmakuList.length > 0) {
+                    playResponse.danmaku = danmakuList;
+                    logInfo('弹幕已添加到播放响应');
+                }
+            }
+        } else if (!DANMU_API) {
+            logInfo('DANMU_API 未配置，跳过弹幕匹配');
         }
 
-        const data = await apiRequest(requestParams, API_PATHS.VURL_DETAIL, 'play');
-
-        const playUrl = data?.url || '';
-        
-        logInfo('播放地址获取成功', { url: playUrl.substring(0, 50) + '...' });
-
-        return {
-            urls: [{ name: '播放', url: playUrl }],
-            parse: 0
-        };
+        return playResponse;
     } catch (error) {
         logError('获取播放地址失败', error);
         return {

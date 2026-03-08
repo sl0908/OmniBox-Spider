@@ -42,6 +42,55 @@ const logError = (message, error) => {
     OmniBox.log("error", `[4KVM-DEBUG] ${message}: ${error.message || error}`);
 };
 
+const encodeMeta = (obj) => {
+    try {
+        return Buffer.from(JSON.stringify(obj || {}), "utf8").toString("base64");
+    } catch {
+        return "";
+    }
+};
+
+const decodeMeta = (str) => {
+    try {
+        const raw = Buffer.from(str || "", "base64").toString("utf8");
+        return JSON.parse(raw || "{}");
+    } catch {
+        return {};
+    }
+};
+
+const buildScrapedEpisodeName = (scrapeData, mapping, originalName) => {
+    if (!mapping || mapping.episodeNumber === 0 || (mapping.confidence && mapping.confidence < 0.5)) {
+        return originalName;
+    }
+    if (mapping.episodeName) {
+        return mapping.episodeName;
+    }
+    if (scrapeData && Array.isArray(scrapeData.episodes)) {
+        const hit = scrapeData.episodes.find(
+            (ep) => ep.episodeNumber === mapping.episodeNumber && ep.seasonNumber === mapping.seasonNumber
+        );
+        if (hit?.name) {
+            return `${hit.episodeNumber}.${hit.name}`;
+        }
+    }
+    return originalName;
+};
+
+const buildScrapedDanmuFileName = (scrapeData, scrapeType, mapping, fallbackVodName, fallbackEpisodeName) => {
+    if (!scrapeData) {
+        return buildFileNameForDanmu(fallbackVodName, fallbackEpisodeName);
+    }
+    if (scrapeType === "movie") {
+        return scrapeData.title || fallbackVodName;
+    }
+    const title = scrapeData.title || fallbackVodName;
+    const seasonAirYear = scrapeData.seasonAirYear || "";
+    const seasonNumber = mapping?.seasonNumber || 1;
+    const episodeNumber = mapping?.episodeNumber || 1;
+    return `${title}.${seasonAirYear}.S${String(seasonNumber).padStart(2, "0")}E${String(episodeNumber).padStart(2, "0")}`;
+};
+
 /**
 * 标准化URL
 */
@@ -249,22 +298,22 @@ const extractPlayOptions = ($, detailUrl) => {
 * 将播放链接数组转换为 vod_play_sources 格式
 * 拼接格式: URL|视频名|集数名
 */
-const parsePlaySources = (playLinks, vodName) => {
+const parsePlaySources = (playLinks, vodName, videoId = "") => {
     if (!playLinks || playLinks.length === 0) {
         return [];
     }
-    const episodes = playLinks.map(link => {
+    const episodes = playLinks.map((link, epIndex) => {
         const parts = link.split('$');
         const episodeName = parts[0] || '正片';
         const actualUrl = parts[1] || parts[0];
-
-        // 关键修改：将 URL、视频名、集数名 拼接到一起
-        // 使用 | 分隔，并对包含 | 的内容进行处理（通常URL和标题不含|）
-        const combinedId = `${actualUrl}|${vodName}|${episodeName}`;
+        const fid = `${videoId}#0#${epIndex}`;
+        const combinedId = `${actualUrl}|||${encodeMeta({ sid: String(videoId || ""), fid, v: vodName || "", e: episodeName })}`;
 
         return {
             name: episodeName,
-            playId: combinedId
+            playId: combinedId,
+            _fid: fid,
+            _rawName: episodeName,
         };
     }).filter(e => e.playId);
 
@@ -704,7 +753,105 @@ async function detail(params) {
         }
 
         // 转换为 vod_play_sources 格式
-        vod.vod_play_sources = parsePlaySources(playLinks, vod.vod_name);
+        const videoIdForScrape = String(videoId || "");
+        const playSources = parsePlaySources(playLinks, vod.vod_name, videoIdForScrape);
+
+        let scrapeData = null;
+        let videoMappings = [];
+        let scrapeType = "";
+        const scrapeCandidates = [];
+
+        for (const source of playSources) {
+            for (const ep of source.episodes || []) {
+                if (!ep._fid) continue;
+                scrapeCandidates.push({
+                    fid: ep._fid,
+                    file_id: ep._fid,
+                    file_name: ep._rawName || ep.name || "正片",
+                    name: ep._rawName || ep.name || "正片",
+                    format_type: "video",
+                });
+            }
+        }
+
+        if (scrapeCandidates.length > 0) {
+            try {
+                const sourceId = `spider_source_${await OmniBox.getSourceId()}_${videoIdForScrape}`;
+                const scrapingResult = await OmniBox.processScraping(sourceId, vod.vod_name || "", vod.vod_name || "", scrapeCandidates);
+                OmniBox.log("info", `[4KVM-DEBUG] 刮削处理完成,结果: ${JSON.stringify(scrapingResult || {}).substring(0, 200)}`);
+
+                const metadata = await OmniBox.getScrapeMetadata(sourceId);
+                scrapeData = metadata?.scrapeData || null;
+                videoMappings = metadata?.videoMappings || [];
+                scrapeType = metadata?.scrapeType || "";
+                logInfo("刮削元数据读取完成", { hasScrapeData: !!scrapeData, mappingCount: videoMappings.length, scrapeType });
+            } catch (error) {
+                logError("刮削处理失败", error);
+            }
+        }
+
+        for (const source of playSources) {
+            for (const ep of source.episodes || []) {
+                const mapping = videoMappings.find((m) => m?.fileId === ep._fid);
+                if (!mapping) continue;
+                const oldName = ep.name;
+                const newName = buildScrapedEpisodeName(scrapeData, mapping, oldName);
+                if (newName && newName !== oldName) {
+                    ep.name = newName;
+                    OmniBox.log("info", `[4KVM-DEBUG] 应用刮削后源文件名: ${oldName} -> ${newName}`);
+                }
+                ep._seasonNumber = mapping.seasonNumber;
+                ep._episodeNumber = mapping.episodeNumber;
+            }
+
+            const hasEpisodeNumber = (source.episodes || []).some(
+                (ep) => ep._episodeNumber !== undefined && ep._episodeNumber !== null
+            );
+            if (hasEpisodeNumber) {
+                source.episodes.sort((a, b) => {
+                    const seasonA = a._seasonNumber || 0;
+                    const seasonB = b._seasonNumber || 0;
+                    if (seasonA !== seasonB) return seasonA - seasonB;
+                    const episodeA = a._episodeNumber || 0;
+                    const episodeB = b._episodeNumber || 0;
+                    return episodeA - episodeB;
+                });
+            }
+        }
+
+        vod.vod_play_sources = playSources.map((source) => ({
+            name: source.name,
+            episodes: (source.episodes || []).map((ep) => ({
+                name: ep.name,
+                playId: ep.playId,
+            })),
+        }));
+
+        if (scrapeData) {
+            vod.vod_name = scrapeData.title || vod.vod_name;
+            if (scrapeData.posterPath) {
+                vod.vod_pic = `https://image.tmdb.org/t/p/w500${scrapeData.posterPath}`;
+            }
+            if (scrapeData.overview) {
+                vod.vod_content = scrapeData.overview;
+            }
+            if (scrapeData.releaseDate) {
+                vod.vod_year = String(scrapeData.releaseDate).substring(0, 4) || vod.vod_year;
+            }
+            const actors = (scrapeData.credits?.cast || []).slice(0, 5).map((c) => c?.name).filter(Boolean).join(",");
+            if (actors) {
+                vod.vod_actor = actors;
+            }
+            const directors = (scrapeData.credits?.crew || [])
+                .filter((c) => c?.job === "Director" || c?.department === "Directing")
+                .slice(0, 3)
+                .map((c) => c?.name)
+                .filter(Boolean)
+                .join(",");
+            if (directors) {
+                vod.vod_director = directors;
+            }
+        }
 
         logInfo(`播放链接数: ${playLinks.length}`);
 
@@ -760,14 +907,54 @@ async function play(params) {
 
     let vodName = "";
     let episodeName = "";
+    let playMeta = {};
 
     // 关键修改：解析透传参数
-    if (playId.includes('|')) {
+    if (playId && playId.includes("|||")) {
+        const [mainPlayId, metaB64] = playId.split("|||");
+        playId = mainPlayId;
+        playMeta = decodeMeta(metaB64 || "");
+        vodName = playMeta.v || "";
+        episodeName = playMeta.e || "";
+        logInfo(`解析透传信息 - 视频: ${vodName}, 集数: ${episodeName}`);
+    } else if (playId && playId.includes('|')) {
+        // 兼容旧格式
         const parts = playId.split('|');
         playId = parts[0];      // 真正的 URL
         vodName = parts[1] || "";
         episodeName = parts[2] || "";
         logInfo(`解析透传信息 - 视频: ${vodName}, 集数: ${episodeName}`);
+    }
+
+    let scrapedDanmuFileName = "";
+    try {
+        const videoIdFromParam = params.vodId ? String(params.vodId) : "";
+        const videoIdFromMeta = playMeta?.sid ? String(playMeta.sid) : "";
+        const videoIdForScrape = videoIdFromParam || videoIdFromMeta;
+        const sourceId = videoIdForScrape
+            ? `spider_source_${await OmniBox.getSourceId()}_${videoIdForScrape}`
+            : "";
+        if (sourceId) {
+            const metadata = await OmniBox.getScrapeMetadata(sourceId);
+            if (metadata && metadata.scrapeData) {
+                const mapping = (metadata.videoMappings || []).find((m) => m?.fileId === playMeta?.fid);
+                scrapedDanmuFileName = buildScrapedDanmuFileName(
+                    metadata.scrapeData,
+                    metadata.scrapeType || "",
+                    mapping,
+                    vodName,
+                    episodeName
+                );
+                if (metadata.scrapeData.title) {
+                    vodName = metadata.scrapeData.title;
+                }
+                if (mapping?.episodeName) {
+                    episodeName = mapping.episodeName;
+                }
+            }
+        }
+    } catch (error) {
+        logInfo(`读取刮削元数据失败: ${error.message}`);
     }
 
     try {
@@ -856,7 +1043,7 @@ async function play(params) {
             const finalVodName = vodName || params.vodName;
             const finalEpisodeName = episodeName || params.episodeName || '';
 
-            const fileName = buildFileNameForDanmu(finalVodName, finalEpisodeName);
+            const fileName = scrapedDanmuFileName || buildFileNameForDanmu(finalVodName, finalEpisodeName);
             logInfo(`尝试匹配弹幕文件名: ${fileName}`);
 
             if (fileName) {

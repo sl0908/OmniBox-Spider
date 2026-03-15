@@ -1,7 +1,7 @@
 // @name 在线之家
 // @author 
 // @description 刮削：支持，弹幕：支持，嗅探：支持
-// @version 1.1.1
+// @version 1.1.2
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/采集/在线之家.js
 
 /**
@@ -79,6 +79,51 @@ const fixUrl = (url) => {
     if (url.startsWith('http')) return url;
     if (url.startsWith('//')) return 'https:' + url;
     return url.startsWith('/') ? `${host}${url}` : `${host}/${url}`;
+};
+
+/**
+ * 处理图片 URL，如果是外部 URL 则通过代理
+ * @param {string} imageUrl - 原始图片 URL
+ * @param {string} baseURL - 代理服务器基础 URL
+ * @param {string} referer - 图片来源的 Referer (默认取 imageUrl 的域名)
+ * @returns {string} 处理后的图片 URL
+ */
+const processImageUrl = (imageUrl, baseURL = "", referer = "") => {
+    if (!imageUrl) return '';
+    
+    // 标准化 URL
+    let url = fixUrl(imageUrl);
+    
+    // 检查是否是外部 URL（不是当前 host 的 URL）
+    const isExternalUrl = !url.includes(host) && url.startsWith('http');
+    
+    // 如果是外部 URL 且有 baseURL，则通过代理
+    if (isExternalUrl && baseURL) {
+        try {
+            // 如果没有指定 referer，从 imageUrl 的域名提取
+            let finalReferer = referer;
+            if (!finalReferer) {
+                try {
+                    const urlObj = new URL(url);
+                    finalReferer = `${urlObj.protocol}//${urlObj.host}`;
+                } catch (e) {
+                    finalReferer = host;
+                }
+            }
+            
+            // 构建带 headers 的 URL 格式: url@Referer=value
+            const urlWithHeaders = `${url}@Referer=${finalReferer}`;
+            // 编码 URL 参数
+            const encodedUrl = encodeURIComponent(urlWithHeaders);
+            // 返回代理 URL
+            return `${baseURL}/api/proxy/image?url=${encodedUrl}`;
+        } catch (error) {
+            logError("处理图片 URL 失败", error);
+            return url;
+        }
+    }
+    
+    return url;
 };
 
 // ========== 解密算法 ==========
@@ -265,9 +310,10 @@ async function matchDanmu(fileName) {
 /**
  * 解析视频列表
  * @param {Object} $ - cheerio 实例
+ * @param {string} baseURL - 代理服务器基础 URL
  * @returns {Array} 视频列表
  */
-const parseVideoList = ($) => {
+const parseVideoList = ($, baseURL = "") => {
     const list = [];
     const items = $('.stui-vodlist__item, .stui-vodlist li, .v-item, .public-list-box');
     items.each((_, element) => {
@@ -292,7 +338,7 @@ const parseVideoList = ($) => {
             list.push({ 
                 vod_id: href, 
                 vod_name: title, 
-                vod_pic: fixUrl(pic), 
+                vod_pic: processImageUrl(pic, baseURL), 
                 vod_remarks: remarks || '' 
             });
         }
@@ -305,7 +351,7 @@ const parseVideoList = ($) => {
 /**
  * 首页
  */
-async function home(params) {
+async function home(params, context) {
     logInfo("进入首页");
     return {
         class: [
@@ -323,16 +369,17 @@ async function home(params) {
 /**
  * 分类
  */
-async function category(params) {
+async function category(params, context) {
     const { categoryId, page } = params;
     const pg = parseInt(page) || 1;
+    const baseURL = context?.baseURL || "";
     logInfo(`请求分类: ${categoryId}, 页码: ${pg}`);
     
     try {
         const url = `${host}/vodshow/${categoryId}--------${pg}---.html`;
         const res = await axiosInstance.get(url);
         const $ = cheerio.load(res.data);
-        const list = parseVideoList($);
+        const list = parseVideoList($, baseURL);
         
         logInfo(`获取到 ${list.length} 个视频`);
         return { list: list, page: pg, pagecount: list.length >= 20 ? pg + 1 : pg };
@@ -345,16 +392,17 @@ async function category(params) {
 /**
  * 搜索
  */
-async function search(params) {
+async function search(params, context) {
     const wd = params.keyword || params.wd || "";
     const pg = parseInt(params.page) || 1;
+    const baseURL = context?.baseURL || "";
     logInfo(`搜索关键词: ${wd}, 页码: ${pg}`);
     
     try {
         const url = `${host}/vodsearch/${encodeURIComponent(wd)}----------${pg}---.html`;
         const res = await axiosInstance.get(url);
         const $ = cheerio.load(res.data);
-        const list = parseVideoList($);
+        const list = parseVideoList($, baseURL);
         
         logInfo(`搜索到 ${list.length} 个结果`);
         return { list: list, page: pg, pagecount: list.length >= 20 ? pg + 1 : pg };
@@ -367,9 +415,10 @@ async function search(params) {
 /**
  * 详情
  */
-async function detail(params) {
+async function detail(params, context) {
     const videoId = params.videoId;
     const url = fixUrl(videoId);
+    const baseURL = context?.baseURL || "";
     logInfo(`请求详情 ID: ${videoId}`);
     
     try {
@@ -379,8 +428,11 @@ async function detail(params) {
         
         // 兼容多种详情页布局
         const title = $('h1.title').text().trim() || $('.stui-content__detail .title').text().trim() || $('title').text().split('-')[0].trim();
-        const pic = $('.stui-content__thumb img').attr('data-original') || $('.stui-content__thumb img').attr('src') || '';
+        let pic = $('.stui-content__thumb img').attr('data-original') || $('.stui-content__thumb img').attr('src') || '';
         const desc = $('.stui-content__detail .desc').text().trim() || $('meta[name="description"]').attr('content') || '';
+        
+        // 处理图片 URL
+        pic = processImageUrl(pic, baseURL);
         
         const playSources = [];
         const $playlists = $('.stui-content__playlist, .stui-pannel__data ul, .playlist');
@@ -484,7 +536,7 @@ async function detail(params) {
         const vod = {
             vod_id: videoId,
             vod_name: title,
-            vod_pic: fixUrl(pic),
+            vod_pic: pic,
             vod_content: desc,
             vod_play_sources: playSources.map((source) => ({
                 name: source.name,
@@ -499,7 +551,8 @@ async function detail(params) {
         if (scrapeData) {
             vod.vod_name = scrapeData.title || vod.vod_name;
             if (scrapeData.posterPath) {
-                vod.vod_pic = `https://image.tmdb.org/t/p/w500${scrapeData.posterPath}`;
+                // 处理 TMDB 图片 URL (referer 自动从 URL 域名提取)
+                vod.vod_pic = processImageUrl(`https://image.tmdb.org/t/p/w500${scrapeData.posterPath}`, baseURL);
             }
             if (scrapeData.overview) {
                 vod.vod_content = scrapeData.overview;

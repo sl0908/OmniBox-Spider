@@ -1,7 +1,7 @@
 // @name 瓜子APP
 // @author 
 // @description 刮削：支持，弹幕：支持，嗅探：支持
-// @version 1.0.3
+// @version 1.0.4
 // @dependencies: axios, crypto
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/%E5%BD%B1%E8%A7%86/%E9%87%87%E9%9B%86/%E7%93%9C%E5%AD%90.js
 
@@ -767,16 +767,36 @@ const getResolutionScore = (res) => {
 async function home(params) {
     try {
         logInfo('处理首页请求');
-        
+
+        const data = await apiRequest({
+            area: '0',
+            year: '0',
+            pageSize: '100',
+            sort: 'd_id',
+            page: '1'
+        }, API_PATHS.INDEX_LIST, 'category');
+
+        let list = [];
+        if (data?.list) {
+            list = data.list.map(item => ({
+                vod_id: `${item.vod_id}/${item.vod_continu || 0}`,
+                vod_name: item.vod_name,
+                vod_pic: item.vod_pic,
+                vod_remarks: (item.vod_continu || 0) === 0 ? '电影' : `更新至${item.vod_continu}集`
+            }));
+        }
+
         return {
             class: CLASSES,
-            filters: FILTERS
+            filters: FILTERS,
+            list
         };
     } catch (error) {
         logError('获取首页数据失败', error);
         return {
             class: [],
-            filters: {}
+            filters: {},
+            list: []
         };
     }
 }

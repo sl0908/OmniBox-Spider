@@ -1,3 +1,10 @@
+// @name 枫叶音乐
+// @author 
+// @description 
+// @dependencies: axios
+// @version 1.0.0
+// @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/音乐/枫叶音乐.js
+
 /**
  * ============================================================================
  * 枫叶音乐 - OmniBox 爬虫脚本

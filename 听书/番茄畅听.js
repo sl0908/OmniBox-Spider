@@ -1,4 +1,11 @@
 // @name 番茄畅听
+// @author 
+// @description 
+// @dependencies: crypto-js
+// @version 1.0.0
+// @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/听书/番茄畅听.js
+
+
 /**
  * OmniBox 听书源脚本：番茄畅听
  *

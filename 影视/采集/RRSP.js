@@ -2,7 +2,7 @@
 // @author 
 // @description 刮削：支持，弹幕：支持，嗅探：支持
 // @dependencies: axios
-// @version 1.0.0
+// @version 1.0.1
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/采集/RRSP.js
 
 
@@ -298,11 +298,10 @@ const arr2vods = (arr, baseURL = '') => {
             remarks = `评分:${i.vod_score || i.vod_douban_score || ''}`;
         }
         videos.push({
-            vod_id: i.vod_id,
+            vod_id: i.vod_id + "",
             vod_name: i.vod_name,
             vod_pic: processImageUrl(i.vod_pic, baseURL),
-            vod_remarks: remarks,
-            vod_year: null
+            vod_remarks: remarks
         });
     }
     return videos;
@@ -337,7 +336,7 @@ async function home(params, context) {
             { 'type_id': '4', 'type_name': '纪录片' },
             { 'type_id': '6', 'type_name': '短剧' }
         ],
-        list
+        list:list
     };
 }
 
@@ -358,8 +357,8 @@ async function category(params, context) {
 
         const r = {
             list: arr2vods(res.data.data.list, baseURL),
-            page: res.data.data.page || pg,
-            pagecount: res.data.data.pagecount || 100
+            page: parseInt(res.data.data.page) || pg,
+            pagecount: parseInt(res.data.data.pagecount) || 100
         };
 
         OmniBox.log("info", `category r：${JSON.stringify(r)}`)

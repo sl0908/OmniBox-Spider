@@ -2,7 +2,7 @@
 // @author
 // @description 刮削：支持，弹幕：支持，播放记录：支持
 // @dependencies: axios, cheerio
-// @version 1.0.1
+// @version 1.0.2
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/网盘/玩偶.js
 
 // 引入 OmniBox SDK
@@ -39,6 +39,8 @@ const SOURCE_NAMES_CONFIG = (process.env.SOURCE_NAMES_CONFIG || "本地代理;�
   .split(";")
   .map((s) => s.trim())
   .filter((s) => s);
+// 详情链路缓存时间（秒），默认 12 小时
+const WOGG_CACHE_EX_SECONDS = Number(process.env.WOGG_CACHE_EX_SECONDS || 43200);
 // ==================== 配置区域结束 ====================
 
 if (WEB_SITES.length === 0) {
@@ -50,6 +52,87 @@ OmniBox.log("info", `配置了 ${WEB_SITES.length} 个域名: ${WEB_SITES.join("
 const INSECURE_HTTPS_AGENT = new https.Agent({
   rejectUnauthorized: false,
 });
+
+function buildCacheKey(prefix, value) {
+  return `${prefix}:${value}`;
+}
+
+async function getCachedJSON(key) {
+  try {
+    return await OmniBox.getCache(key);
+  } catch (error) {
+    OmniBox.log("warn", `[cache] 读取缓存失败: key=${key}, err=${error.message}`);
+    return null;
+  }
+}
+
+async function setCachedJSON(key, value, exSeconds) {
+  try {
+    await OmniBox.setCache(key, value, exSeconds);
+  } catch (error) {
+    OmniBox.log("warn", `[cache] 写入缓存失败: key=${key}, err=${error.message}`);
+  }
+}
+
+async function getDetailPageCached(videoId) {
+  const cacheKey = buildCacheKey("wogg:detailHtml", videoId);
+  let detailPage = await getCachedJSON(cacheKey);
+  if (!detailPage) {
+    detailPage = await requestWithFailover(videoId);
+    if (detailPage && detailPage.response && detailPage.response.statusCode === 200 && detailPage.response.body) {
+      await setCachedJSON(cacheKey, detailPage, WOGG_CACHE_EX_SECONDS);
+    }
+  }
+  return detailPage;
+}
+
+async function getDriveInfoCached(shareURL) {
+  const cacheKey = buildCacheKey("wogg:driveInfo", shareURL);
+  let driveInfo = await getCachedJSON(cacheKey);
+  if (!driveInfo) {
+    driveInfo = await OmniBox.getDriveInfoByShareURL(shareURL);
+    await setCachedJSON(cacheKey, driveInfo, WOGG_CACHE_EX_SECONDS);
+  }
+  return driveInfo;
+}
+
+async function getRootFileListCached(shareURL) {
+  const cacheKey = buildCacheKey("wogg:rootFiles", shareURL);
+  let fileList = await getCachedJSON(cacheKey);
+  if (!fileList) {
+    fileList = await OmniBox.getDriveFileList(shareURL, "0");
+    if (fileList && fileList.files && Array.isArray(fileList.files)) {
+      await setCachedJSON(cacheKey, fileList, WOGG_CACHE_EX_SECONDS);
+    }
+  }
+  return fileList;
+}
+
+async function getAllVideoFilesCached(shareURL, rootFiles) {
+  const cacheKey = buildCacheKey("wogg:videoFiles", shareURL);
+  let allVideoFiles = await getCachedJSON(cacheKey);
+  if (!Array.isArray(allVideoFiles) || allVideoFiles.length === 0) {
+    allVideoFiles = await getAllVideoFiles(shareURL, rootFiles, "0");
+    if (Array.isArray(allVideoFiles) && allVideoFiles.length > 0) {
+      await setCachedJSON(cacheKey, allVideoFiles, WOGG_CACHE_EX_SECONDS);
+    }
+  }
+  return allVideoFiles;
+}
+
+async function collectDriveTypeCountMap(panUrls = []) {
+  const driveTypeCountMap = {};
+  for (const shareURL of panUrls) {
+    try {
+      const driveInfo = await getDriveInfoCached(shareURL);
+      const displayName = driveInfo?.displayName || "未知网盘";
+      driveTypeCountMap[displayName] = (driveTypeCountMap[displayName] || 0) + 1;
+    } catch (error) {
+      OmniBox.log("warn", `统计网盘类型失败: ${shareURL}, error=${error.message}`);
+    }
+  }
+  return driveTypeCountMap;
+}
 
 async function httpRequest(url, options = {}) {
   const method = (options.method || "GET").toUpperCase();
@@ -465,7 +548,7 @@ async function detail(params) {
     const source = params.source || "";
     OmniBox.log("info", `获取视频详情: videoId=${videoId}, source=${source}`);
 
-    const { response, baseUrl } = await requestWithFailover(videoId);
+    const { response, baseUrl } = await getDetailPageCached(videoId);
 
     if (response.statusCode !== 200 || !response.body) {
       throw new Error(`请求失败: HTTP ${response.statusCode}`);
@@ -519,12 +602,7 @@ async function detail(params) {
 
     const playSources = [];
 
-    const driveTypeCountMap = {};
-    for (const shareURL of panUrls) {
-      const driveInfo = await OmniBox.getDriveInfoByShareURL(shareURL);
-      const displayName = driveInfo.displayName || "未知网盘";
-      driveTypeCountMap[displayName] = (driveTypeCountMap[displayName] || 0) + 1;
-    }
+    const driveTypeCountMap = await collectDriveTypeCountMap(panUrls);
 
     const driveTypeCurrentIndexMap = {};
 
@@ -533,7 +611,7 @@ async function detail(params) {
       try {
         OmniBox.log("info", `处理网盘链接: ${shareURL}`);
 
-        const driveInfo = await OmniBox.getDriveInfoByShareURL(shareURL);
+        const driveInfo = await getDriveInfoCached(shareURL);
         let displayName = driveInfo.displayName || "未知网盘";
 
         const totalCount = driveTypeCountMap[displayName] || 0;
@@ -544,7 +622,7 @@ async function detail(params) {
 
         OmniBox.log("info", `网盘类型: ${displayName}, driveType: ${driveInfo.driveType}`);
 
-        const fileList = await OmniBox.getDriveFileList(shareURL, "0");
+        const fileList = await getRootFileListCached(shareURL);
         if (!fileList || !fileList.files || !Array.isArray(fileList.files)) {
           OmniBox.log("warn", `获取文件列表失败: ${shareURL}`);
           return null;
@@ -552,7 +630,7 @@ async function detail(params) {
 
         OmniBox.log("info", `获取文件列表成功,文件数量: ${fileList.files.length}`);
 
-        const allVideoFiles = await getAllVideoFiles(shareURL, fileList.files, "0");
+        const allVideoFiles = await getAllVideoFilesCached(shareURL, fileList.files);
 
         if (allVideoFiles.length === 0) {
           OmniBox.log("warn", `未找到视频文件: ${shareURL}`);

@@ -1,7 +1,7 @@
 // @name 盘搜分组
 // @author 
 // @description 刮削：支持，弹幕：支持，嗅探：支持，只支持tvbox接口
-// @version 1.2.2
+// @version 1.2.3
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/网盘/盘搜分组.js
 
 /**
@@ -93,6 +93,52 @@ function inferDriveTypeFromShareURL(shareURL = "") {
     if (raw.includes("115.com")) return "115";
     if (raw.includes("123684.com") || raw.includes("123865.com") || raw.includes("123912.com") || raw.includes("123pan.com")) return "pan123";
     return "";
+}
+
+function resolveCallerSource(params = {}, context = {}) {
+    return String(context?.from || params?.source || "").toLowerCase();
+}
+
+function filterSourceNamesForCaller(sourceNames = [], callerSource = "") {
+    let filtered = Array.isArray(sourceNames) ? [...sourceNames] : [];
+
+    if (callerSource === "web") {
+        filtered = filtered.filter((name) => name !== "本地代理");
+        OmniBox.log("info", "来源为网页端，已过滤掉\"本地代理\"线路");
+    } else if (callerSource === "emby") {
+        filtered = filtered.filter((name) => name === "服务端代理");
+        OmniBox.log("info", "来源为 emby，网盘多线路仅保留\"服务端代理\"");
+    } else if (callerSource === "uz") {
+        filtered = filtered.filter((name) => name !== "本地代理");
+        OmniBox.log("info", "来源为 uz，已屏蔽\"本地代理\"线路");
+    }
+
+    return filtered.length > 0 ? filtered : ["直连"];
+}
+
+function resolveRouteType(flag = "", callerSource = "") {
+    let routeType = "直连";
+
+    if (callerSource === "web" || callerSource === "emby") {
+        routeType = "服务端代理";
+    }
+
+    if (flag) {
+        if (flag.includes("-")) {
+            const parts = flag.split("-");
+            routeType = parts[parts.length - 1];
+        } else {
+            routeType = flag;
+        }
+    }
+
+    if (callerSource === "emby") {
+        routeType = "服务端代理";
+    } else if (callerSource === "uz" && routeType === "本地代理") {
+        routeType = "直连";
+    }
+
+    return routeType;
 }
 
 function sortPlaySourcesByDriveOrder(playSources = []) {
@@ -1029,7 +1075,7 @@ async function search(params) {
 /**
 * 详情
 */
-async function detail(params) {
+async function detail(params, context) {
     try {
         OmniBox.log("info", `详情接口调用,参数: ${JSON.stringify(params)}`);
 
@@ -1038,7 +1084,7 @@ async function detail(params) {
             throw new Error("视频ID不能为空");
         }
 
-        const source = params.source || "";
+        const source = resolveCallerSource(params, context);
 
         const parts = videoId.split("|");
         const shareURL = parts[0] || "";
@@ -1194,12 +1240,9 @@ async function detail(params) {
 
         if (targetDriveTypes.includes(driveInfo.driveType)) {
             sourceNames = [...configSourceNames];
-            OmniBox.log("info", `${displayName} 匹配 DRIVE_TYPE_CONFIG，线路设置为: ${sourceNames.join(", ")}`);
-
-            if (source === "web") {
-                sourceNames = sourceNames.filter((name) => name !== "本地代理");
-                OmniBox.log("info", "来源为网页端，已过滤掉\"本地代理\"线路");
-            }
+            OmniBox.log("info", `${displayName} 匹配 DRIVE_TYPE_CONFIG，初始线路设置为: ${sourceNames.join(", ")}`);
+            sourceNames = filterSourceNamesForCaller(sourceNames, source);
+            OmniBox.log("info", `来源=${source || "unknown"}，最终线路设置为: ${sourceNames.join(", ")}`);
         }
 
         for (const sourceName of sourceNames) {
@@ -1364,11 +1407,11 @@ async function detail(params) {
 /**
 * 播放
 */
-async function play(params) {
+async function play(params, context) {
     try {
         let flag = params.flag || "";
         const playId = params.playId || "";
-        const source = params.source || "";
+        const source = resolveCallerSource(params, context);
 
         if (!playId) {
             throw new Error("播放参数不能为空");
@@ -1439,16 +1482,8 @@ async function play(params) {
             OmniBox.log("warn", `弹幕匹配失败: ${error.message}`);
         }
 
-        // 线路解析: 默认网页端走服务端代理，其它直连；若 flag 含前缀，取最后一段
-        let routeType = source === "web" ? "服务端代理" : "直连";
-        if (flag) {
-            if (flag.includes("-")) {
-                const parts = flag.split("-");
-                routeType = parts[parts.length - 1];
-            } else {
-                routeType = flag;
-            }
-        }
+        // 线路解析: 默认 web/emby 走服务端代理，其它直连；若 flag 含前缀，取最后一段
+        const routeType = resolveRouteType(flag, source);
 
         const playInfo = await OmniBox.getDriveVideoPlayInfo(shareURL, fileId, routeType);
 
